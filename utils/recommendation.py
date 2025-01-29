@@ -1,12 +1,93 @@
+import boto3
+import os
+import io
+import faiss
 import pandas as pd
 import numpy as np
 import pickle
-# from scipy.sparse import csr_matrix
-# from sklearn.metrics.pairwise import cosine_similarity
 import h5py
 import streamlit as st
+import fsspec
+from sklearn.feature_extraction.text import TfidfVectorizer
 
 _movies = None
+_movie_vectors = None
+# AWS S3 Configuration
+BUCKET_NAME = "movielens-clived"  # Change to your bucket name
+
+@st.cache_resource
+def download_model(filename, bucket_name=BUCKET_NAME):
+    """
+    Download the model file from AWS S3 if not already downloaded.
+
+    Args:
+        filename (str): The name of the file to download.
+        bucket_name (str): The AWS S3 bucket containing the model.
+
+    Returns:
+        str: The local path of the downloaded model file.
+    """
+    local_model_path = f"../models/{filename}"
+
+    # Check if the model already exists locally
+    if not os.path.exists(local_model_path):
+        st.write(f":::::::::{local_model_path}")
+        st.write(f"📥 Downloading {filename} from S3...")
+
+        # Load AWS credentials (Streamlit secrets first, fallback to environment variables)
+        aws_access_key = st.secrets["MOVIELENS_AWS_ACCESS_KEY_ID"] if "MOVIELENS_AWS_ACCESS_KEY_ID" in st.secrets else os.getenv("MOVIELENS_AWS_ACCESS_KEY_ID")
+        aws_secret_key = st.secrets["MOVIELENS_AWS_SECRET_ACCESS_KEY"] if "MOVIELENS_AWS_SECRET_ACCESS_KEY" in st.secrets else os.getenv("MOVIELENS_AWS_SECRET_ACCESS_KEY")
+
+        # Initialize S3 client
+        s3 = boto3.client(
+            "s3",
+            aws_access_key_id=aws_access_key,
+            aws_secret_access_key=aws_secret_key
+        )
+
+        try:
+            # Download model file
+            with open(local_model_path, "wb") as f:
+                s3.download_fileobj(bucket_name, filename, f)
+            st.write(f"✅ Model downloaded and saved as {local_model_path}")
+        except Exception as e:
+            st.error(f"❌ Failed to download {filename} from S3: {e}")
+            return None
+
+    return local_model_path
+
+@st.cache_resource
+def load_models():
+    """Load the models from disk."""
+    model_path = download_model('movie_factors.pkl')
+    with open(model_path, "rb") as f:
+        movie_factors = pickle.load(f)
+
+    model_path = download_model('movie_indices.pkl')
+    with open(model_path, "rb") as f:
+        movie_indices = pickle.load(f)
+
+    model_path = download_model('user_factors.pkl')
+    with open(model_path, "rb") as f:
+        user_factors = pickle.load(f)
+
+    # model_path = download_model('faiss_gpu_index40k-1024.bin')
+    model_path = download_model('faiss_gpu_index60k-1800.bin')
+    with open(model_path, "rb") as f:
+        faiss_index = faiss.read_index(model_path)
+
+    return movie_indices, user_factors, movie_factors, faiss_index
+
+def load_csv_from_s3(filename):
+    """Fetch CSV file from S3 and load it into a Pandas DataFrame."""
+    s3 = boto3.client(
+        "s3",
+        aws_access_key_id=os.getenv("MOVIELENS_AWS_ACCESS_KEY_ID"),
+        aws_secret_access_key=os.getenv("MOVIELENS_AWS_SECRET_ACCESS_KEY")
+    )
+
+    response = s3.get_object(Bucket=BUCKET_NAME, Key=filename)
+    return pd.read_csv(io.BytesIO(response["Body"].read()))
 
 def get_movies():
     """
@@ -16,70 +97,97 @@ def get_movies():
     """
     global _movies
     if _movies is None:
-        _movies = pd.read_csv("data/cleaned_remapped_movies.csv")
+        # _movies = pd.read_csv("data/cleaned_remapped_movies.csv")
+        _movies = load_csv_from_s3('cleaned_remapped_movies.csv')
+
     return _movies
 
-# Load models and data
-def load_models():
-    with open("models/movie_indices.pkl", "rb") as f:
-        movie_indices = pickle.load(f)
-    with open("models/user_factors.pkl", "rb") as f:
-        user_factors = pickle.load(f)
-    with open("models/movie_factors.pkl", "rb") as f:
-        movie_factors = pickle.load(f)
-    return movie_indices, user_factors, movie_factors
-
-
-movie_indices, user_factors, movie_factors = load_models()
-
-
-# Content-Based Recommendation
-def recommend_content_based(title, num_recommendations=10, h5_file='models/cosine_sim.h5', min_similarity=0.4):
-    movies = get_movies()
-    # st.write(":::::::: Content-Based Recommendations .....")
+def get_movie_vectors():
     """
-    Recommend movies similar to the given title using content-based filtering.
-    Adding a min_similarity threshhold dramatically improves this content-based recommendation especially when used
-    along in a hybrid recommendation system
+    Load the TF-IDF matrix as a singleton.
+    Returns:
+        csr_matrix: TF-IDF matrix.
+    """
+
+    global _movie_vectors
+    if _movie_vectors is None:
+        # Initialize TF-IDF Vectorizer
+        st.write("___________ Initializing TFIDF Matrix .................")
+        tfidf = TfidfVectorizer(stop_words='english')
+
+        # Fit and transform the combined features
+        tfidf_matrix = tfidf.fit_transform(_movies['combined_features'])
+        st.write("___________ TFIDF Matrix initialized .................")
+
+        # Convert the sparse TF-IDF matrix to a dense NumPy array for FAISS
+        st.write("___________ Convert sparse TFIDF Matrix to dense numpy array for FAISS  ..........")
+        _movie_vectors = tfidf_matrix.toarray().astype('float32')
+        st.write("___________ Dense numpy array for FAISS initialized  ..........")
+
+    return _movie_vectors
+
+st.write("::::::::::: Loading models .................")
+movie_indices, user_factors, movie_factors, faiss_index = load_models()
+st.write("::::::::::: Models loaded .................")
+
+def recommend_content_based(title, num_recommendations=10, min_similarity=0.4):
+    """
+    Recommend movies similar to the given title using FAISS for content-based filtering.
 
     Args:
         title (str): Movie title.
         num_recommendations (int): Number of recommendations.
+        min_similarity (float): Minimum similarity threshold.
 
     Returns:
         list: Recommended movie titles.
     """
     # Normalize the movie title
     normalized_title = title.lower().strip()
-    
+
     # Get the index of the input movie
     if normalized_title not in movie_indices:
         raise ValueError(f"Movie '{title}' not found in the dataset.")
-    idx = movie_indices[normalized_title]
     
-    # Open the HDF5 file and retrieve the relevant row (cosine similarity scores)
-    # Instead of loading the entire cosine_sim matrix into memory, retrieve only the relevant row using the index idx.
-    with h5py.File(h5_file, 'r') as f:
-        sim_scores = f['cosine_sim'][idx]  # Retrieve the row corresponding to the movie
+    idx = movie_indices[normalized_title]
 
-    # Process the similarity scores to get recommendations
-    sim_scores = list(enumerate(sim_scores))
+    movies = get_movies()
+    
+    st.write("::::::::::: Initializing movie vectors .................")
+    movie_vectors = get_movie_vectors()
+    
+
+    # # Convert the sparse TF-IDF matrix to a dense NumPy array for FAISS
+    # movie_vectors = tfidf_matrix.toarray().astype('float32')
+
+    # Retrieve similarity scores from FAISS
+    st.write("::::::::::: Searching FAISS for Similar Movies .................")
+    query_vector = movie_vectors[idx].reshape(1, -1).astype('float32')
+    distances, recommended_indices = faiss_index.search(query_vector, num_recommendations + 1)  # +1 to skip the input movie
+    st.write("::::::::::: FAISS Search Complete .................")
+
+    # Process similarity scores
+    sim_scores = list(zip(recommended_indices[0], distances[0]))
 
     # Filter by similarity threshold
     sim_scores = [(i, score) for i, score in sim_scores if score >= min_similarity]
-    
+
+    st.write("::::::::::: Applying Similarity Threshold .................")
+
+    # Sort by similarity (Descending)
     sim_scores = sorted(sim_scores, key=lambda x: x[1], reverse=True)[1:num_recommendations+1]  # Skip the movie itself
     recommended_indices = [i[0] for i in sim_scores]
-    
+
+    st.write("::::::::::: Mapping movie titles to recommended indices .................")
+
     # Retrieve recommended movie titles and convert to title case
     recommended_titles = movies['title'].iloc[recommended_indices].str.title()
+
     return recommended_titles
 
 
 # Collaborative Filtering Recommendation
 def recommend_collaborative(user_id, num_recommendations=5):
-    movies = get_movies()
-    # st.write(":::::::: Collaborative Recommendations .........")
     """
     Recommend movies for a user using collaborative filtering.
 
@@ -90,11 +198,6 @@ def recommend_collaborative(user_id, num_recommendations=5):
     Returns:
         list: Recommended movie titles.
     """
-    # # Load user and movie factors
-    # with open("../models/user_factors.pkl", "rb") as f:
-    #     user_factors = pickle.load(f)
-    # with open("../models/movie_factors.pkl", "rb") as f:
-    #     movie_factors = pickle.load(f)
 
     # Validate user_id
     if user_id is None:
@@ -112,13 +215,13 @@ def recommend_collaborative(user_id, num_recommendations=5):
     recommended_movie_indices = np.argsort(scores)[::-1][:num_recommendations]
 
     # Map indices to movie titles
+    movies = get_movies()
     recommended_titles = movies.loc[movies.index.isin(recommended_movie_indices), 'title'].tolist()
     return recommended_titles
 
 
 # Hybrid Recommendation
 def recommend_hybrid(title, user_id=None, content_weight=0.5, collab_weight=0.5, num_recommendations=10):
-    # st.write(":::::::: Hybrid Recommendation ......:")
     """
     Hybrid recommendation combining content-based and collaborative filtering.
     
@@ -132,9 +235,7 @@ def recommend_hybrid(title, user_id=None, content_weight=0.5, collab_weight=0.5,
     Returns:
         list: Recommended movie titles.
     """
-    # st.write(":::::::: Collab weight => ", collab_weight)
-    # st.write(":::::::: Content weight => ", content_weight)
-    # st.write(":::::::: User ID => ", user_id)
+
     # Validate weights
     if content_weight + collab_weight != 1.0:
         raise ValueError("Content weight and collaboration weight must sum to 1.0.")
