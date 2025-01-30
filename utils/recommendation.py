@@ -9,72 +9,38 @@ import h5py
 import streamlit as st
 import fsspec
 from sklearn.feature_extraction.text import TfidfVectorizer
+from scipy.sparse import csr_matrix
 
 _movies = None
 _movie_vectors = None
+_faiss_index = None
 # AWS S3 Configuration
 BUCKET_NAME = "movielens-clived"  # Change to your bucket name
 
 @st.cache_resource
-def download_model(filename, bucket_name=BUCKET_NAME):
-    """
-    Download the model file from AWS S3 if not already downloaded.
+def load_faiss_index():
+    """Load FAISS index efficiently with memory-mapping (prevents large RAM usage)."""
+    global _faiss_index
+    if _faiss_index is None:
+        faiss_db_path = "models/faiss_gpu_index60k-1800.bin"
+        print(":::::::: Memory-Mapping FAISS Index...")
+        _faiss_index = faiss.read_index(faiss_db_path, faiss.IO_FLAG_MMAP)  # Memory-mapped FAISS
+    return _faiss_index
 
-    Args:
-        filename (str): The name of the file to download.
-        bucket_name (str): The AWS S3 bucket containing the model.
-
-    Returns:
-        str: The local path of the downloaded model file.
-    """
-    local_model_path = f"../models/{filename}"
-
-    # Check if the model already exists locally
-    if not os.path.exists(local_model_path):
-        st.write(f":::::::::{local_model_path}")
-        st.write(f"📥 Downloading {filename} from S3...")
-
-        # Load AWS credentials (Streamlit secrets first, fallback to environment variables)
-        aws_access_key = st.secrets["MOVIELENS_AWS_ACCESS_KEY_ID"] if "MOVIELENS_AWS_ACCESS_KEY_ID" in st.secrets else os.getenv("MOVIELENS_AWS_ACCESS_KEY_ID")
-        aws_secret_key = st.secrets["MOVIELENS_AWS_SECRET_ACCESS_KEY"] if "MOVIELENS_AWS_SECRET_ACCESS_KEY" in st.secrets else os.getenv("MOVIELENS_AWS_SECRET_ACCESS_KEY")
-
-        # Initialize S3 client
-        s3 = boto3.client(
-            "s3",
-            aws_access_key_id=aws_access_key,
-            aws_secret_access_key=aws_secret_key
-        )
-
-        try:
-            # Download model file
-            with open(local_model_path, "wb") as f:
-                s3.download_fileobj(bucket_name, filename, f)
-            st.write(f"✅ Model downloaded and saved as {local_model_path}")
-        except Exception as e:
-            st.error(f"❌ Failed to download {filename} from S3: {e}")
-            return None
-
-    return local_model_path
 
 @st.cache_resource
 def load_models():
     """Load the models from disk."""
-    model_path = download_model('movie_factors.pkl')
-    with open(model_path, "rb") as f:
+    with open('models/movie_factors.pkl', "rb") as f:
         movie_factors = pickle.load(f)
 
-    model_path = download_model('movie_indices.pkl')
-    with open(model_path, "rb") as f:
+    with open('models/movie_indices.pkl', "rb") as f:
         movie_indices = pickle.load(f)
 
-    model_path = download_model('user_factors.pkl')
-    with open(model_path, "rb") as f:
+    with open('models/user_factors.pkl', "rb") as f:
         user_factors = pickle.load(f)
 
-    # model_path = download_model('faiss_gpu_index40k-1024.bin')
-    model_path = download_model('faiss_gpu_index60k-1800.bin')
-    with open(model_path, "rb") as f:
-        faiss_index = faiss.read_index(model_path)
+    faiss_index = load_faiss_index()  # Memory-mapped FAISS index
 
     return movie_indices, user_factors, movie_factors, faiss_index
 
@@ -87,7 +53,7 @@ def load_csv_from_s3(filename):
     )
 
     response = s3.get_object(Bucket=BUCKET_NAME, Key=filename)
-    return pd.read_csv(io.BytesIO(response["Body"].read()))
+    return pd.read_csv(io.BytesIO(response["Body"].read()), low_memory=False) # Efficient reading
 
 def get_movies():
     """
@@ -96,32 +62,28 @@ def get_movies():
         pd.DataFrame: Movies DataFrame.
     """
     global _movies
+    
     if _movies is None:
-        # _movies = pd.read_csv("data/cleaned_remapped_movies.csv")
+        st.write("::::::::::: Loading movies from S3 .................")
         _movies = load_csv_from_s3('cleaned_remapped_movies.csv')
-
+        st.write("::::::::::: Movies loaded from S3 .................")
     return _movies
 
 def get_movie_vectors():
-    """
-    Load the TF-IDF matrix as a singleton.
-    Returns:
-        csr_matrix: TF-IDF matrix.
-    """
-
     global _movie_vectors
     if _movie_vectors is None:
-        # Initialize TF-IDF Vectorizer
-        st.write("___________ Initializing TFIDF Matrix .................")
+        # Load the TF-IDF matrix as a sparse CSR matrix to save memory.
+        st.write("___________ Initializing sparse TF-IDF Matrix .................")
         tfidf = TfidfVectorizer(stop_words='english')
 
         # Fit and transform the combined features
-        tfidf_matrix = tfidf.fit_transform(_movies['combined_features'])
+        tfidf_matrix = tfidf.fit_transform(get_movies()['combined_features'])
         st.write("___________ TFIDF Matrix initialized .................")
 
         # Convert the sparse TF-IDF matrix to a dense NumPy array for FAISS
         st.write("___________ Convert sparse TFIDF Matrix to dense numpy array for FAISS  ..........")
-        _movie_vectors = tfidf_matrix.toarray().astype('float32')
+        
+        _movie_vectors = csr_matrix(tfidf_matrix)  # Do not convert to dense NumPy array
         st.write("___________ Dense numpy array for FAISS initialized  ..........")
 
     return _movie_vectors
@@ -162,7 +124,7 @@ def recommend_content_based(title, num_recommendations=10, min_similarity=0.4):
 
     # Retrieve similarity scores from FAISS
     st.write("::::::::::: Searching FAISS for Similar Movies .................")
-    query_vector = movie_vectors[idx].reshape(1, -1).astype('float32')
+    query_vector = movie_vectors[idx].toarray().reshape(1, -1).astype('float32')
     distances, recommended_indices = faiss_index.search(query_vector, num_recommendations + 1)  # +1 to skip the input movie
     st.write("::::::::::: FAISS Search Complete .................")
 
@@ -239,25 +201,26 @@ def recommend_hybrid(title, user_id=None, content_weight=0.5, collab_weight=0.5,
     # Validate weights
     if content_weight + collab_weight != 1.0:
         raise ValueError("Content weight and collaboration weight must sum to 1.0.")
-        
-    # Content-based recommendations
-    content_recommendations = recommend_content_based(title, num_recommendations=100)
 
     # Collaborative recommendations
     if user_id is None:
+        # Content-based recommendations. Set min_similarity = 0.3 to ensure we have enough unique recommendations
+        content_recommendations = recommend_content_based(title, num_recommendations=100, min_similarity=0.3)
+
         collaborative_recommendations = []
+
+        combined_recommendations = (pd.Series(content_recommendations).value_counts(normalize=True)).sort_values(ascending=False).head(20)
     else:
+        # Content-based recommendations. Set min_similarity = 0.4 to get fewer but more relevant recommendations
+        content_recommendations = recommend_content_based(title, num_recommendations=100, min_similarity=0.4)
         collaborative_recommendations = recommend_collaborative(user_id, num_recommendations=100)
 
-    # Combine scores (assume both return lists of movie titles)
-    combined_recommendations = (
-        content_weight * pd.Series(content_recommendations).value_counts(normalize=True) +
-        collab_weight * pd.Series(collaborative_recommendations).value_counts(normalize=True)
-    ).sort_values(ascending=False)
-
-    # # Return top-N recommendations
-    # return combined_recommendations.head(num_recommendations).index.tolist()
-    # Convert to title case
+        # Combine scores (assume both return lists of movie titles)
+        combined_recommendations = (
+            content_weight * pd.Series(content_recommendations).value_counts(normalize=True) +
+            collab_weight * pd.Series(collaborative_recommendations).value_counts(normalize=True)
+        ).sort_values(ascending=False)
+    
     top_recommendations = combined_recommendations.head(num_recommendations).index.tolist()
     top_recommendations_title_case = [title.title() for title in top_recommendations]
 
