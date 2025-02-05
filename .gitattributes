@@ -1,3 +1,4 @@
 models/cosine_sim.h5 filter=lfs diff=lfs merge=lfs -text
 models/user_factors.pkl filter=lfs diff=lfs merge=lfs -text
 models/faiss_gpu_index60k-1800.bin filter=lfs diff=lfs merge=lfs -text
+raw[[:space:]]data/ml-32m.zip filter=lfs diff=lfs merge=lfs -text
