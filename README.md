@@ -1,4 +1,3 @@
-
 # **Movie Recommendation System**
 
 A hybrid movie recommendation system built using **content-based filtering** and **collaborative filtering**, deployed as an interactive web application with **Streamlit**.
@@ -26,26 +25,32 @@ A hybrid movie recommendation system built using **content-based filtering** and
 ## **Installation**
 
 ### Prerequisites
+
 - Python 3.7+
 - pip (Python package manager)
 
 ### Steps
+
 1. **Clone the Repository**:
+
    ```bash
    git clone https://github.com/your-username/movie-recommendation-system.git
    cd movie-recommendation-system
    ```
 
 2. **Install Dependencies**:
+
    ```bash
    pip install -r requirements.txt
    ```
 
 3. **Prepare Data**:
+
    - Place your dataset files (`movies.csv`, `ratings.csv`) in the `data/` folder.
    - Ensure the required models (`cosine_sim.h5`, `user_factors.pkl`, `movie_factors.pkl`, `movie_indices.pkl`) are in the `models/` folder.
 
 4. **Run the Application**:
+
    ```bash
    streamlit run app.py
    ```
@@ -83,15 +88,19 @@ movie-recommendation-system/
 ## **Usage**
 
 1. **Enter a Movie Title**:
+
    - Input a movie title (e.g., `"Toy Story (1995)"`) to get recommendations.
 
 2. **Optionally Enter a User ID**:
+
    - Provide a user ID to personalize recommendations using collaborative filtering.
 
 3. **Adjust Weights**:
+
    - Use the sliders to control the balance between content-based and collaborative recommendations.
 
 4. **Set Number of Recommendations**:
+
    - Choose how many recommendations to display.
 
 5. **View Results**:
@@ -102,14 +111,16 @@ movie-recommendation-system/
 ## **Key Features**
 
 - **Customizable Hybrid Recommendations**:
-   - Adjust weights for content-based and collaborative filtering to get tailored results.
+
+  - Adjust weights for content-based and collaborative filtering to get tailored results.
 
 - **Efficient Memory Usage**:
-   - Precomputed cosine similarity matrix stored in HDF5 format for content-based filtering.
-   - Optimized SVD for collaborative filtering.
+
+  - Precomputed cosine similarity matrix stored in a FAISS vector store for content-based filtering.
+  - Optimized SVD for collaborative filtering.
 
 - **Interactive Interface**:
-   - Built with Streamlit for a user-friendly experience.
+  - Built with Streamlit for a user-friendly experience.
 
 ---
 
